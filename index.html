@@ -903,11 +903,11 @@
             <div class="iso-priority" id="isoPriority"></div>
 
             <div id="sheetsConfigBar" class="sheets-config-bar" style="display:none;">
-                        <span>☁️ <strong>Google Sheets Sync:</strong></span>
-                        <input type="text" id="sheetsUrl" placeholder="Paste URL Apps Script kamu di sini..." style="flex:1;">
-                        <input type="text" id="sheetsUserName" placeholder="Nama kamu" style="min-width:120px;max-width:180px;">
-                        <button onclick="saveSheetConfig()">Simpan & Sync</button>
-                        <span class="config-status" id="configStatus"></span>
+                        <span>☁️ <strong>Google Sheets Sync Aktif</strong></span>
+                        <span id="configStatus" class="config-status"></span>
+                        <span style="margin-left:auto; font-size:0.78rem;">Nama:</span>
+                        <input type="text" id="sheetsUserName" placeholder="Nama kamu" style="min-width:120px;max-width:180px;" onchange="saveUserName()">
+                        <button onclick="saveUserName()">Simpan Nama</button>
                     </div>
                     <div id="isoTrackingProgress"></div>
                     <div id="isoDomains"></div>
@@ -1110,25 +1110,37 @@
             "Keamanan Siber": "6 dokumen keamanan. Pastikan SOP-KJT-001 (Fisik), SOP-KJT-003 (Aplikasi), SOP-KJT-005 (Jaringan) tidak overlap dalam cakupan pengamanan infrastruktur."
 };
 
-        // Load saved pergub data from localStorage
+        // Load saved pergub data from cache (loaded from Sheets or localStorage)
         function loadPergubData() {
             try {
-                const saved = localStorage.getItem('sop-pergub-data');
-                if (saved) {
-                    const data = JSON.parse(saved);
-                    documents.forEach(doc => {
+                var data = pergubCache;
+                if (Object.keys(data).length > 0) {
+                    documents.forEach(function(doc) {
                         if (data[doc.code]) doc.pergub = data[doc.code];
                     });
+                } else {
+                    var saved = localStorage.getItem('sop-pergub-data');
+                    if (saved) {
+                        var localData = JSON.parse(saved);
+                        documents.forEach(function(doc) {
+                            if (localData[doc.code]) doc.pergub = localData[doc.code];
+                        });
+                    }
                 }
             } catch(e) {}
         }
 
-        function savePergubData() {
-            const data = {};
-            documents.forEach(doc => {
+        function savePergubData(docCode, pergubValue) {
+            var data = {};
+            documents.forEach(function(doc) {
                 if (doc.pergub) data[doc.code] = doc.pergub;
             });
+            pergubCache = data;
             try { localStorage.setItem('sop-pergub-data', JSON.stringify(data)); } catch(e) {}
+            // Sync to Sheets
+            if (docCode) {
+                pushToSheetsGeneric({ type: 'pergub', docCode: docCode, pergub: pergubValue || '' });
+            }
         }
 
         loadPergubData();
@@ -1333,7 +1345,7 @@
         document.getElementById('detailPergub').addEventListener('input', (e) => {
             if (currentDetailIndex >= 0) {
                 documents[currentDetailIndex].pergub = e.target.value.trim();
-                savePergubData();
+                savePergubData(documents[currentDetailIndex].code, e.target.value.trim());
                 updateStats();
                 render();
             }
@@ -1395,7 +1407,7 @@
             const doc = documents.find(d => d.code === code);
             if (doc) {
                 doc.pergub = el.value.trim();
-                savePergubData();
+                savePergubData(code, el.value.trim());
                 updateStats();
                 // Update pergub stats
                 const mapped = documents.filter(d => d.pergub).length;
@@ -1549,6 +1561,28 @@
             }
         ];
 
+
+        // Maturity status tracking
+        function getMaturityStatus(itemKey, originalStatus) {
+            return maturityCache[itemKey] || originalStatus;
+        }
+        function cycleMaturityStatus(itemKey, originalStatus) {
+            var current = getMaturityStatus(itemKey, originalStatus);
+            var next;
+            if (current === 'missing') next = 'partial';
+            else if (current === 'partial') next = 'done';
+            else if (current === 'done') next = 'missing';
+            else next = 'done';
+            if (next === originalStatus) {
+                delete maturityCache[itemKey];
+            } else {
+                maturityCache[itemKey] = next;
+            }
+            localStorage.setItem('sop-maturity-data', JSON.stringify(maturityCache));
+            pushToSheetsGeneric({ type: 'maturity', itemKey: itemKey, status: next });
+            renderMaturityTab();
+        }
+
         function renderMaturityTab() {
             const container = document.getElementById('maturityTimeline');
             let html = '';
@@ -1558,7 +1592,11 @@
                 const badgeClass = level.status;
                 const badgeText = level.status === 'achieved' ? 'Tercapai' : (level.status === 'in-progress' ? 'Target 2026' : 'Perencanaan');
 
-                const doneCount = level.items.filter(i => i.status === 'done').length;
+                var doneCount = 0;
+                level.items.forEach(function(item, idx) {
+                    var eff = getMaturityStatus('mat-L' + level.level + '-' + idx, item.status);
+                    if (eff === 'done') doneCount++;
+                });
                 const totalCount = level.items.length;
 
                 html += `
@@ -1577,15 +1615,22 @@
                         <div class="maturity-body">
                             <div class="maturity-desc">${level.desc}</div>
                             <ul class="maturity-checklist">
-                                ${level.items.map(item => `
-                                    <li>
-                                        <span class="check-icon ${item.status}">${item.status === 'done' ? '✅' : (item.status === 'partial' ? '🟡' : '❌')}</span>
-                                        <div>
-                                            <div class="maturity-item-label">${item.text}</div>
-                                            ${item.docs ? `<div class="maturity-item-docs">${item.docs}</div>` : ''}
-                                        </div>
-                                    </li>
-                                `).join('')}
+                                ${level.items.map(function(item, idx) {
+                                    var itemKey = 'mat-L' + level.level + '-' + idx;
+                                    var effStatus = getMaturityStatus(itemKey, item.status);
+                                    var isOverridden = effStatus !== item.status;
+                                    return '<li>' +
+                                        '<span class="check-icon ' + effStatus + '" style="cursor:pointer;" onclick="cycleMaturityStatus(\'' + itemKey + '\', \'' + item.status + '\')">' +
+                                            (effStatus === 'done' ? '✅' : (effStatus === 'partial' ? '🟡' : '❌')) +
+                                        '</span>' +
+                                        '<div>' +
+                                            '<div class="maturity-item-label">' + item.text +
+                                                (isOverridden ? ' <span style="font-size:0.72rem;color:var(--accent-blue);">✏️ diubah</span>' : '') +
+                                            '</div>' +
+                                            (item.docs ? '<div class="maturity-item-docs">' + item.docs + '</div>' : '') +
+                                        '</div>' +
+                                    '</li>';
+                                }).join('')}
                             </ul>
                         </div>
                     </div>
@@ -1820,7 +1865,7 @@
         // ============================================================
         // Google Sheets Sync + localStorage fallback
         // ============================================================
-        var SHEETS_URL = localStorage.getItem('sheetsApiUrl') || '';
+        var SHEETS_URL = 'https://script.google.com/macros/s/AKfycbzckbBPyBJIReG1RRh7COWmKj_Lb4jAT2qy_DafK7LDiV75JS72bhFp9UH4QkDsVWzvwQ/exec';
         var SHEETS_USER = localStorage.getItem('sheetsUserName') || '';
         var isoOverridesCache = {};
         var syncStatus = 'offline'; // synced, syncing, offline
@@ -1854,46 +1899,78 @@
             }
         }
 
-        // Save config
-        function saveSheetConfig() {
-            var url = document.getElementById('sheetsUrl').value.trim();
+        // Save user name
+        function saveUserName() {
             var name = document.getElementById('sheetsUserName').value.trim();
-            if (!url) { alert('Masukkan URL Apps Script'); return; }
             if (!name) { alert('Masukkan nama kamu'); return; }
-            SHEETS_URL = url;
             SHEETS_USER = name;
-            localStorage.setItem('sheetsApiUrl', url);
             localStorage.setItem('sheetsUserName', name);
-            document.getElementById('configStatus').textContent = 'Menyimpan...';
-            loadFromSheets(function() {
-                document.getElementById('configStatus').textContent = 'Tersinkronisasi!';
-                renderISOTab();
-            });
+            var cs = document.getElementById('configStatus');
+            if (cs) cs.textContent = 'Nama tersimpan: ' + name;
         }
 
-        // Load all overrides from Google Sheets
+        // Shared caches for all synced data
+        var pergubCache = {};
+        var maturityCache = {};
+        var gapCache = {};
+
+        // Load ALL data from Google Sheets
         function loadFromSheets(callback) {
             if (!SHEETS_URL) {
-                // No Sheets configured, load from localStorage
                 try { isoOverridesCache = JSON.parse(localStorage.getItem('isoStatusOverrides') || '{}'); } catch(e) { isoOverridesCache = {}; }
+                try { pergubCache = JSON.parse(localStorage.getItem('sop-pergub-data') || '{}'); } catch(e) { pergubCache = {}; }
+                try { maturityCache = JSON.parse(localStorage.getItem('sop-maturity-data') || '{}'); } catch(e) { maturityCache = {}; }
+                try { gapCache = JSON.parse(localStorage.getItem('sop-gap-checks') || '{}'); } catch(e) { gapCache = {}; }
                 syncStatus = 'offline';
                 if (callback) callback();
                 return;
             }
             syncStatus = 'syncing';
             updateSyncBadge();
-            fetch(SHEETS_URL)
+            fetch(SHEETS_URL + '?type=all')
                 .then(function(r) { return r.json(); })
                 .then(function(data) {
                     if (data.success && data.data) {
-                        var overrides = {};
-                        var keys = Object.keys(data.data);
-                        for (var i = 0; i < keys.length; i++) {
-                            var k = keys[i];
-                            overrides[k] = data.data[k].status;
+                        // ISO
+                        if (data.data.iso) {
+                            var isoOv = {};
+                            var isoKeys = Object.keys(data.data.iso);
+                            for (var i = 0; i < isoKeys.length; i++) {
+                                isoOv[isoKeys[i]] = data.data.iso[isoKeys[i]].value;
+                            }
+                            isoOverridesCache = isoOv;
+                            localStorage.setItem('isoStatusOverrides', JSON.stringify(isoOv));
                         }
-                        isoOverridesCache = overrides;
-                        localStorage.setItem('isoStatusOverrides', JSON.stringify(overrides));
+                        // Pergub
+                        if (data.data.pergub) {
+                            var pgOv = {};
+                            var pgKeys = Object.keys(data.data.pergub);
+                            for (var i = 0; i < pgKeys.length; i++) {
+                                pgOv[pgKeys[i]] = data.data.pergub[pgKeys[i]].value;
+                            }
+                            pergubCache = pgOv;
+                            localStorage.setItem('sop-pergub-data', JSON.stringify(pgOv));
+                        }
+                        // Maturity
+                        if (data.data.maturity) {
+                            var mtOv = {};
+                            var mtKeys = Object.keys(data.data.maturity);
+                            for (var i = 0; i < mtKeys.length; i++) {
+                                mtOv[mtKeys[i]] = data.data.maturity[mtKeys[i]].value;
+                            }
+                            maturityCache = mtOv;
+                            localStorage.setItem('sop-maturity-data', JSON.stringify(mtOv));
+                        }
+                        // Gap
+                        if (data.data.gap) {
+                            var gpOv = {};
+                            var gpKeys = Object.keys(data.data.gap);
+                            for (var i = 0; i < gpKeys.length; i++) {
+                                gpOv[gpKeys[i]] = data.data.gap[gpKeys[i]].value === 'done';
+                            }
+                            gapCache = gpOv;
+                            localStorage.setItem('sop-gap-checks', JSON.stringify(gpOv));
+                        }
                         syncStatus = 'synced';
                     } else {
                         syncStatus = 'offline';
@@ -1904,25 +1981,29 @@
                 .catch(function(err) {
                     console.log('Sheets sync error, falling back to localStorage:', err);
                     try { isoOverridesCache = JSON.parse(localStorage.getItem('isoStatusOverrides') || '{}'); } catch(e) { isoOverridesCache = {}; }
+                    try { pergubCache = JSON.parse(localStorage.getItem('sop-pergub-data') || '{}'); } catch(e) { pergubCache = {}; }
+                    try { maturityCache = JSON.parse(localStorage.getItem('sop-maturity-data') || '{}'); } catch(e) { maturityCache = {}; }
+                    try { gapCache = JSON.parse(localStorage.getItem('sop-gap-checks') || '{}'); } catch(e) { gapCache = {}; }
                     syncStatus = 'offline';
                     updateSyncBadge();
                     if (callback) callback();
                 });
         }
 
-        // Push a single status change to Google Sheets
+        // Push a single change to Google Sheets
         function pushToSheets(controlId, newStatus) {
+            pushToSheetsGeneric({ type: 'iso', controlId: controlId, status: newStatus });
+        }
+
+        function pushToSheetsGeneric(payload) {
             if (!SHEETS_URL) return;
             syncStatus = 'syncing';
             updateSyncBadge();
+            payload.updatedBy = SHEETS_USER || 'Anonymous';
             fetch(SHEETS_URL, {
                 method: 'POST',
                 headers: { 'Content-Type': 'text/plain' },
-                body: JSON.stringify({
-                    controlId: controlId,
-                    status: newStatus,
-                    updatedBy: SHEETS_USER || 'Anonymous'
-                })
+                body: JSON.stringify(payload)
             })
             .then(function(r) { return r.json(); })
             .then(function(data) {
@@ -1943,13 +2024,25 @@
             el.innerHTML = '<span class="sync-dot"></span> ' + labels[syncStatus];
         }
 
-        // Show/hide Sheets config bar
+        // Show config bar and auto-prompt for name
         function initSheetsConfig() {
             var bar = document.getElementById('sheetsConfigBar');
             if (bar) {
                 bar.style.display = 'flex';
-                if (SHEETS_URL) document.getElementById('sheetsUrl').value = SHEETS_URL;
-                if (SHEETS_USER) document.getElementById('sheetsUserName').value = SHEETS_USER;
+                var nameInput = document.getElementById('sheetsUserName');
+                if (SHEETS_USER) {
+                    nameInput.value = SHEETS_USER;
+                    var cs = document.getElementById('configStatus');
+                    if (cs) cs.textContent = 'Tersinkronisasi';
+                } else {
+                    // Auto-prompt for name on first use
+                    var name = prompt('Masukkan nama kamu untuk tracking perubahan ISO:');
+                    if (name && name.trim()) {
+                        SHEETS_USER = name.trim();
+                        localStorage.setItem('sheetsUserName', SHEETS_USER);
+                        nameInput.value = SHEETS_USER;
+                    }
+                }
             }
         }
 
@@ -2452,13 +2545,18 @@
         ];
 
         function loadGapChecks() {
+            if (Object.keys(gapCache).length > 0) return Object.assign({}, gapCache);
             try {
-                const saved = localStorage.getItem('sop-gap-checks');
+                var saved = localStorage.getItem('sop-gap-checks');
                 return saved ? JSON.parse(saved) : {};
             } catch(e) { return {}; }
         }
         function saveGapChecks(checks) {
+            gapCache = Object.assign({}, checks);
             try { localStorage.setItem('sop-gap-checks', JSON.stringify(checks)); } catch(e) {}
+        }
+        function syncGapCheck(itemId, checked) {
+            pushToSheetsGeneric({ type: 'gap', itemId: itemId, checked: checked });
         }
 
         function renderGapPlanTab() {
@@ -2513,6 +2611,7 @@
             const checks = loadGapChecks();
             checks[id] = !checks[id];
             saveGapChecks(checks);
+            syncGapCheck(id, checks[id]);
             renderGapPlanTab();
         }
 
